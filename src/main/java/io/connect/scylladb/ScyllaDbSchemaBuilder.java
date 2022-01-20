@@ -1,5 +1,16 @@
 package io.connect.scylladb;
 
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
 import com.datastax.driver.core.DataType;
 import com.datastax.driver.core.SchemaChangeListenerBase;
 import com.datastax.driver.core.Statement;
@@ -14,22 +25,18 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ComparisonChain;
 import io.connect.scylladb.topictotable.TopicConfigs;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.data.Date;
-import org.apache.kafka.connect.data.*;
+import org.apache.kafka.connect.data.Decimal;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Time;
+import org.apache.kafka.connect.data.Timestamp;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
 
@@ -84,6 +91,10 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
       dataType = DataType.date();
     } else if (Decimal.LOGICAL_NAME.equals(schema.name())) {
       dataType = DataType.decimal();
+    } else if ("com.dataroid.connect.data.UUID".equals(schema.name())) {
+      dataType = DataType.uuid();
+    } else if ("com.dataroid.connect.data.TEXT".equals(schema.name())) {
+      dataType = DataType.text();
     } else {
       switch (schema.type()) {
         case MAP:
@@ -325,7 +336,7 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
         fields.add(keyField.name());
       }
 
-      final Header clusterKeys = record.headers().lastWithName("clusterKeys");
+      final Header clusterKeys = record.headers().lastWithName("table.clusterKeys");
 
       if (Objects.nonNull(clusterKeys)) {
         final Map<String, Schema> keys = (Map<String, Schema>) clusterKeys.value();
@@ -337,7 +348,7 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
         }
       }
 
-      final Header clusterKeysDirections = record.headers().lastWithName("clusterKeysDirections");
+      final Header clusterKeysDirections = record.headers().lastWithName("table.clusterKeysDirections");
 
       if (Objects.nonNull(clusterKeysDirections)) {
         final Map<String, String> directions = (Map<String, String>) clusterKeysDirections.value();
@@ -366,12 +377,130 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
       tableOptions.compressionOptions(config.tableCompressionAlgorithm).buildInternal();
       log.info("create() - Adding table {}.{}\n{}", keyspace, tableName, tableOptions);
       session.executeStatement(tableOptions);
+
+      final String materializedViewQuery = createMaterializedViewQuery(keyspace, tableName, record.valueSchema());
+      log.info("create() - Materialized view : {}", materializedViewQuery);
+      session.executeQuery(createMaterializedViewQuery(keyspace, tableName, record.valueSchema()));
     } else {
       throw new DataException(
               String.format("Create statement needed:\n%s", create)
       );
     }
     this.schemaLookup.put(key, DEFAULT);
+  }
+
+  public String createMaterializedViewQuery(final String keyspace, final String tableName, final Schema valueSchema) {
+    String materializedViewName = tableName + "_" + this.config.mvNameExtension;
+    materializedViewName = materializedViewName.replaceAll("\\W", "");
+
+    final Pattern materializedViewNamePattern = Pattern.compile("^[a-zA-Z][a-zA-Z0-9\\_]+$");
+    final Matcher matcherToValidate = materializedViewNamePattern.matcher(materializedViewName);
+
+    if (!matcherToValidate.matches()) {
+      throw new DataException(String.format("Materialized view name (%s) is not valid.", materializedViewName));
+    }
+
+    final List<String> selectColumns = this.config.mvSelectColumns;
+
+    if (selectColumns.size() == 0) {
+      throw new ConfigException("There needs to be selected columns to create materialized view.");
+    }
+
+    if (!(selectColumns.size() == 1 && selectColumns.get(0).equals("*"))) {
+      selectColumns.forEach(selectColumn -> {
+        if (Objects.isNull(valueSchema.field(selectColumn))) {
+          throw new ConfigException(String.format(
+              "The select column (%s) is not defined in value schema",
+              selectColumn
+          ));
+        }
+      });
+    }
+
+    final String selectStatement = Joiner.on(", ").join(selectColumns);
+
+    List<String> whereClauseItems = this.config.mvWhereClauseProperties;
+    whereClauseItems.forEach(whereClauseItem -> {
+      if (Objects.isNull(valueSchema.field(whereClauseItem))) {
+        throw new ConfigException(String.format(
+            "The where clause item (%s) is not defined in value schema",
+            whereClauseItem
+        ));
+      }
+    });
+
+    whereClauseItems = whereClauseItems.stream().map(where -> {
+      where = where + " IS NOT null";
+
+      return where;
+    }).collect(Collectors.toList());
+
+    final String whereStatement = Joiner.on(" AND ").join(whereClauseItems);
+
+    final List<String> partitionKeys = this.config.mvPartitionKeys;
+    partitionKeys.forEach(partitionKey -> {
+      if (Objects.isNull(valueSchema.field(partitionKey))) {
+        throw new ConfigException(String.format("The partition key (%s) is not defined in value schema", partitionKey));
+      }
+    });
+
+    final String partitionKeyStatement = Joiner.on(", ").join(partitionKeys);
+
+    final Map<String, String> clusterKeysPropertyMap = new LinkedHashMap<>();
+    this.config.mvClusterKeys.forEach(clusterKeyProperties -> {
+      final String[] parts = clusterKeyProperties.split(":");
+
+      if (parts.length != 2) {
+        throw new ConfigException(String.format("The cluster keys config (%s) is invalid.", clusterKeyProperties));
+      }
+
+      clusterKeysPropertyMap.put(parts[0], parts[1]);
+    });
+
+    clusterKeysPropertyMap.keySet().forEach(clusterKey -> {
+      if (Objects.isNull(valueSchema.field(clusterKey))) {
+        throw new ConfigException(String.format("The cluster key (%s) is not defined in value schema", clusterKey));
+      }
+    });
+
+    final String clusterKeyStatement = Joiner.on(", ").join(clusterKeysPropertyMap.keySet());
+
+    final List<String> clusterKeysDirections = clusterKeysPropertyMap
+        .entrySet()
+        .stream()
+        .map(clusterKeysProperty -> {
+              String direction = "ASC";
+
+              if (clusterKeysProperty.getValue().equals("desc")) {
+                direction = "DESC";
+              }
+
+              return clusterKeysProperty.getKey() + " " + direction;
+            }
+        ).collect(Collectors.toList());
+
+    final String clusterKeyDirectionStatement = Joiner.on(", ").join(clusterKeysDirections);
+
+    final String materializedViewQuery =
+        "CREATE MATERIALIZED VIEW %s.%s AS "
+            + "SELECT %s "
+            + "FROM %s.%s "
+            + "WHERE %s "
+            + "PRIMARY KEY ((%s), %s) "
+            + "WITH CLUSTERING ORDER BY (%s);";
+
+    return String.format(
+        materializedViewQuery,
+        keyspace,
+        materializedViewName,
+        selectStatement,
+        keyspace,
+        tableName,
+        whereStatement,
+        partitionKeyStatement,
+        clusterKeyStatement,
+        clusterKeyDirectionStatement
+    );
   }
 
   static class ScyllaDbSchemaKey implements Comparable<ScyllaDbSchemaKey> {
