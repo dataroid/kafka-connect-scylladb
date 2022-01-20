@@ -6,7 +6,6 @@ import com.datastax.driver.core.Statement;
 import com.datastax.driver.core.schemabuilder.Alter;
 import com.datastax.driver.core.schemabuilder.Create;
 import com.datastax.driver.core.schemabuilder.SchemaBuilder;
-import com.datastax.driver.core.schemabuilder.TableOptions;
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
@@ -18,6 +17,7 @@ import io.connect.scylladb.topictotable.TopicConfigs;
 import org.apache.kafka.connect.data.Date;
 import org.apache.kafka.connect.data.*;
 import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -304,7 +304,7 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
     }
 
     Create create = SchemaBuilder.createTable(keyspace, tableName);
-    final TableOptions<?> tableOptions = create.withOptions();
+    final Create.Options tableOptions = create.withOptions();
     if (!Strings.isNullOrEmpty(valueSchema.doc())) {
       tableOptions.comment(valueSchema.doc());
     }
@@ -323,6 +323,32 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
         final DataType dataType = dataType(keyField.schema());
         create.addPartitionKey(keyField.name(), dataType);
         fields.add(keyField.name());
+      }
+
+      final Header clusterKeys = record.headers().lastWithName("clusterKeys");
+
+      if (Objects.nonNull(clusterKeys)) {
+        final Map<String, Schema> keys = (Map<String, Schema>) clusterKeys.value();
+
+        for (Map.Entry<String, Schema> entry : keys.entrySet()) {
+          fields.add(entry.getKey());
+          final DataType dataType = dataType(entry.getValue().schema());
+          create.addClusteringColumn(entry.getKey(), dataType);
+        }
+      }
+
+      final Header clusterKeysDirections = record.headers().lastWithName("clusterKeysDirections");
+
+      if (Objects.nonNull(clusterKeysDirections)) {
+        final Map<String, String> directions = (Map<String, String>) clusterKeysDirections.value();
+
+        for (Map.Entry<String, String> entry : directions.entrySet()) {
+          if (entry.getValue().equals(SchemaBuilder.Direction.DESC.name())) {
+            tableOptions.clusteringOrder(entry.getKey(), SchemaBuilder.Direction.DESC);
+          } else if (entry.getValue().equals(SchemaBuilder.Direction.ASC.name())) {
+            tableOptions.clusteringOrder(entry.getKey(), SchemaBuilder.Direction.ASC);
+          }
+        }
       }
 
       for (final Field valueField : valueSchema.fields()) {
