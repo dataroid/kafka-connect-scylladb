@@ -624,35 +624,35 @@ public class ScyllaDbSinkConnectorConfig extends AbstractConfig {
             .define(
                 MV_NAME_EXTENSION_CONFIG,
                 ConfigDef.Type.STRING,
-                ConfigDef.NO_DEFAULT_VALUE,
+                null,
                 ConfigDef.Importance.LOW,
                 "Materialized view extension to set the materialized view name"
             )
             .define(
                 MV_SELECT_CONFIG,
                 ConfigDef.Type.LIST,
-                ConfigDef.NO_DEFAULT_VALUE,
+                null,
                 ConfigDef.Importance.LOW,
                 "Materialized view select statement column names"
             )
             .define(
                 MV_WHERE_CLAUSE_CONFIG,
                 ConfigDef.Type.LIST,
-                ConfigDef.NO_DEFAULT_VALUE,
+                null,
                 ConfigDef.Importance.LOW,
                 "Properties to set the where clause of materialized view"
             )
             .define(
                 MV_PARTITION_KEYS_CONFIG,
                 ConfigDef.Type.LIST,
-                ConfigDef.NO_DEFAULT_VALUE,
+                null,
                 ConfigDef.Importance.LOW,
                 "Keys to set the partition of the materialized view"
             )
             .define(
                 MV_CLUSTER_KEYS_CONFIG,
                 ConfigDef.Type.LIST,
-                ConfigDef.NO_DEFAULT_VALUE,
+                null,
                 ConfigDef.Importance.LOW,
                 "Keys to set the cluster of the materialized view"
             );
