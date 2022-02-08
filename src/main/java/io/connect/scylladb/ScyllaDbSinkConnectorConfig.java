@@ -3,11 +3,14 @@ package io.connect.scylladb;
 import java.io.File;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import io.connect.scylladb.utils.SchemaUtil;
 import org.apache.kafka.common.config.AbstractConfig;
 import org.apache.kafka.common.config.ConfigDef;
 
@@ -23,6 +26,7 @@ import io.confluent.kafka.connect.utils.config.ValidEnum;
 import io.confluent.kafka.connect.utils.config.ValidPort;
 import io.connect.scylladb.topictotable.TopicConfigs;
 import io.netty.handler.ssl.SslProvider;
+import org.apache.kafka.connect.data.Schema;
 
 /**
  * Configuration class for {@link ScyllaDbSinkConnector}.
@@ -58,11 +62,12 @@ public class ScyllaDbSinkConnectorConfig extends AbstractConfig {
   public final List<String> cipherSuites;
   public final File certFilePath;
   public final File privateKeyPath;
-  public final String mvNameExtension;
-  public final List<String> mvSelectColumns;
-  public final List<String> mvWhereClauseProperties;
-  public final List<String> mvPartitionKeys;
-  public final List<String> mvClusterKeys;
+  public final List<String> clusterKeys;
+  public final String materializedViewNameExtension;
+  public final List<String> materializedViewSelectColumns;
+  public final List<String> materializedViewWhereClauseProperties;
+  public final List<String> materializedViewPartitionKeys;
+  public final List<String> materializedViewClusterKeys;
 
   private static final Pattern TOPIC_KS_TABLE_SETTING_PATTERN =
           Pattern.compile("topic\\.([a-zA-Z0-9._-]+)\\.([^.]+|\"[\"]+\")\\.([^.]+|\"[\"]+\")\\.(keyspace|mapping|consistencyLevel|ttlSeconds|deletesEnabled)$");
@@ -95,12 +100,12 @@ public class ScyllaDbSinkConnectorConfig extends AbstractConfig {
     this.deletesEnabled = getBoolean(DELETES_ENABLE_CONFIG);
 
     this.keyspace = getString(KEYSPACE_CONFIG);
-
-    this.mvNameExtension = getString(MV_NAME_EXTENSION_CONFIG);
-    this.mvSelectColumns = getList(MV_SELECT_CONFIG);
-    this.mvWhereClauseProperties = getList(MV_WHERE_CLAUSE_CONFIG);
-    this.mvPartitionKeys = getList(MV_PARTITION_KEYS_CONFIG);
-    this.mvClusterKeys = getList(MV_CLUSTER_KEYS_CONFIG);
+    this.clusterKeys = getList(CLUSTER_KEYS_CONFIG);
+    this.materializedViewNameExtension = getString(MATERIALIZEDVIEW_NAME_EXTENSION_CONFIG);
+    this.materializedViewSelectColumns = getList(MATERIALIZEDVIEW_SELECT_CONFIG);
+    this.materializedViewWhereClauseProperties = getList(MATERIALIZEDVIEW_WHERE_CLAUSE_CONFIG);
+    this.materializedViewPartitionKeys = getList(MATERIALIZEDVIEW_PARTITION_KEYS_CONFIG);
+    this.materializedViewClusterKeys = getList(MATERIALIZEDVIEW_CLUSTER_KEYS_CONFIG);
 
     this.ttl = getInt(TTL_CONFIG);
 
@@ -233,11 +238,13 @@ public class ScyllaDbSinkConnectorConfig extends AbstractConfig {
           + "if a keyspace is created by the connector. The Replication Factor (RF) is equivalent "
           + "to the number of nodes where data (rows and partitions) are replicated. Data is replicated to multiple (RF=N) nodes";
 
-  public static final String MV_NAME_EXTENSION_CONFIG = "scylladb.mvName.extension";
-  public static final String MV_SELECT_CONFIG = "scylladb.mv.select";
-  public static final String MV_WHERE_CLAUSE_CONFIG = "scylladb.mv.where";
-  public static final String MV_PARTITION_KEYS_CONFIG = "scylladb.mv.partitionKeys";
-  public static final String MV_CLUSTER_KEYS_CONFIG = "scylladb.mv.clusterKeys";
+  public static final String CLUSTER_KEYS_CONFIG = "scylladb.clusterKeys";
+
+  public static final String MATERIALIZEDVIEW_NAME_EXTENSION_CONFIG = "scylladb.materializedViewName.extension";
+  public static final String MATERIALIZEDVIEW_SELECT_CONFIG = "scylladb.materializedView.select";
+  public static final String MATERIALIZEDVIEW_WHERE_CLAUSE_CONFIG = "scylladb.materializedView.where";
+  public static final String MATERIALIZEDVIEW_PARTITION_KEYS_CONFIG = "scylladb.materializedView.partitionKeys";
+  public static final String MATERIALIZEDVIEW_CLUSTER_KEYS_CONFIG = "scylladb.materializedView.clusterKeys";
 
   public static final String COMPRESSION_CONFIG = "scylladb.compression";
   private static final String COMPRESSION_DOC = "Compression algorithm to use when connecting to ScyllaDB. "
@@ -621,38 +628,64 @@ public class ScyllaDbSinkConnectorConfig extends AbstractConfig {
                     BEHAVIOR_ON_ERROR_DISPLAY
                     //Recommenders.enumValues(BehaviorOnError.class)
             )
+            .define(CLUSTER_KEYS_CONFIG,
+                ConfigDef.Type.LIST,
+                null,
+                (name, valueObject) -> {
+                  @SuppressWarnings("unchecked")
+                  final List<String> value = (List<String>) valueObject;
+
+                  if (Objects.nonNull(value)) {
+                    final Map<String, String> tableClusterKeysDirections = SchemaUtil.parseMappings(value);
+
+                    SchemaUtil.validateClusterKeyDirections(tableClusterKeysDirections);
+                  }
+                },
+                ConfigDef.Importance.LOW,
+                "Cluster keys to set the cluster columns as creating table"
+            )
             .define(
-                MV_NAME_EXTENSION_CONFIG,
+                MATERIALIZEDVIEW_NAME_EXTENSION_CONFIG,
                 ConfigDef.Type.STRING,
                 null,
                 ConfigDef.Importance.LOW,
                 "Materialized view extension to set the materialized view name"
             )
             .define(
-                MV_SELECT_CONFIG,
+                MATERIALIZEDVIEW_SELECT_CONFIG,
                 ConfigDef.Type.LIST,
                 null,
                 ConfigDef.Importance.LOW,
                 "Materialized view select statement column names"
             )
             .define(
-                MV_WHERE_CLAUSE_CONFIG,
+                MATERIALIZEDVIEW_WHERE_CLAUSE_CONFIG,
                 ConfigDef.Type.LIST,
                 null,
                 ConfigDef.Importance.LOW,
                 "Properties to set the where clause of materialized view"
             )
             .define(
-                MV_PARTITION_KEYS_CONFIG,
+                MATERIALIZEDVIEW_PARTITION_KEYS_CONFIG,
                 ConfigDef.Type.LIST,
                 null,
                 ConfigDef.Importance.LOW,
                 "Keys to set the partition of the materialized view"
             )
             .define(
-                MV_CLUSTER_KEYS_CONFIG,
+                MATERIALIZEDVIEW_CLUSTER_KEYS_CONFIG,
                 ConfigDef.Type.LIST,
                 null,
+                (name, valueObject) -> {
+                  @SuppressWarnings("unchecked")
+                  final List<String> value = (List<String>) valueObject;
+
+                  if (Objects.nonNull(value)) {
+                    final Map<String, String> tableClusterKeysDirections = SchemaUtil.parseMappings(value);
+
+                    SchemaUtil.validateClusterKeyDirections(tableClusterKeysDirections);
+                  }
+                },
                 ConfigDef.Importance.LOW,
                 "Keys to set the cluster of the materialized view"
             );

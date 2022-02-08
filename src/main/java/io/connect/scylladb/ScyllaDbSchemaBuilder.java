@@ -25,6 +25,7 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ComparisonChain;
 import io.connect.scylladb.topictotable.TopicConfigs;
+import io.connect.scylladb.utils.SchemaUtil;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.connect.data.Date;
 import org.apache.kafka.connect.data.Decimal;
@@ -91,9 +92,9 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
       dataType = DataType.date();
     } else if (Decimal.LOGICAL_NAME.equals(schema.name())) {
       dataType = DataType.decimal();
-    } else if ("com.dataroid.connect.data.UUID".equals(schema.name())) {
+    } else if ("UUID".equals(schema.name())) {
       dataType = DataType.uuid();
-    } else if ("com.dataroid.connect.data.TEXT".equals(schema.name())) {
+    } else if ("TEXT".equals(schema.name())) {
       dataType = DataType.text();
     } else {
       switch (schema.type()) {
@@ -336,24 +337,25 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
         fields.add(keyField.name());
       }
 
-      final Header clusterKeys = record.headers().lastWithName("table.clusterKeys");
+      final List<String> clusterKeyList = this.config.clusterKeys;
 
-      if (Objects.nonNull(clusterKeys)) {
-        final Map<String, Schema> keys = (Map<String, Schema>) clusterKeys.value();
+      if (Objects.nonNull(clusterKeyList)) {
 
-        for (Map.Entry<String, Schema> entry : keys.entrySet()) {
-          fields.add(entry.getKey());
-          final DataType dataType = dataType(entry.getValue().schema());
-          create.addClusteringColumn(entry.getKey(), dataType);
+        final Map<String, String> clusterKeyMap = SchemaUtil.parseMappings(clusterKeyList);
+
+        for (String clusterKey : clusterKeyMap.keySet()) {
+          final Field valueField = valueSchema.field(clusterKey);
+
+          if (Objects.isNull(valueField)) {
+            throw new DataException(String.format("The cluster key (%s) must to exist in record value", clusterKey));
+          }
+
+          fields.add(clusterKey);
+          final DataType dataType = dataType(valueField.schema());
+          create.addClusteringColumn(clusterKey, dataType);
         }
-      }
 
-      final Header clusterKeysDirections = record.headers().lastWithName("table.clusterKeysDirections");
-
-      if (Objects.nonNull(clusterKeysDirections)) {
-        final Map<String, String> directions = (Map<String, String>) clusterKeysDirections.value();
-
-        for (Map.Entry<String, String> entry : directions.entrySet()) {
+        for (final Map.Entry<String, String> entry : clusterKeyMap.entrySet()) {
           if (entry.getValue().equals(SchemaBuilder.Direction.DESC.name())) {
             tableOptions.clusteringOrder(entry.getKey(), SchemaBuilder.Direction.DESC);
           } else if (entry.getValue().equals(SchemaBuilder.Direction.ASC.name())) {
@@ -390,19 +392,19 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
   }
 
   public String createMaterializedViewQuery(final String keyspace, final String tableName, final Schema valueSchema) {
-    String materializedViewName = tableName + "_" + this.config.mvNameExtension;
+    String materializedViewName = tableName + "_" + this.config.materializedViewNameExtension;
     materializedViewName = materializedViewName.replaceAll("\\W", "");
 
     final Pattern materializedViewNamePattern = Pattern.compile("^[a-zA-Z][a-zA-Z0-9\\_]+$");
     final Matcher matcherToValidate = materializedViewNamePattern.matcher(materializedViewName);
 
     if (!matcherToValidate.matches()) {
-      throw new DataException(String.format("Materialized view name (%s) is not valid.", materializedViewName));
+      throw new ConfigException(String.format("Materialized view name (%s) is not valid.", materializedViewName));
     }
 
-    final List<String> selectColumns = this.config.mvSelectColumns;
+    final List<String> selectColumns = this.config.materializedViewSelectColumns;
 
-    if (selectColumns.size() == 0) {
+    if (Objects.isNull(selectColumns) || selectColumns.size() == 0) {
       throw new ConfigException("There needs to be selected columns to create materialized view.");
     }
 
@@ -419,88 +421,105 @@ class ScyllaDbSchemaBuilder extends SchemaChangeListenerBase {
 
     final String selectStatement = Joiner.on(", ").join(selectColumns);
 
-    List<String> whereClauseItems = this.config.mvWhereClauseProperties;
-    whereClauseItems.forEach(whereClauseItem -> {
-      if (Objects.isNull(valueSchema.field(whereClauseItem))) {
-        throw new ConfigException(String.format(
-            "The where clause item (%s) is not defined in value schema",
-            whereClauseItem
-        ));
-      }
-    });
-
-    whereClauseItems = whereClauseItems.stream().map(where -> {
-      where = where + " IS NOT null";
-
-      return where;
-    }).collect(Collectors.toList());
-
-    final String whereStatement = Joiner.on(" AND ").join(whereClauseItems);
-
-    final List<String> partitionKeys = this.config.mvPartitionKeys;
-    partitionKeys.forEach(partitionKey -> {
-      if (Objects.isNull(valueSchema.field(partitionKey))) {
-        throw new ConfigException(String.format("The partition key (%s) is not defined in value schema", partitionKey));
-      }
-    });
-
-    final String partitionKeyStatement = Joiner.on(", ").join(partitionKeys);
-
-    final Map<String, String> clusterKeysPropertyMap = new LinkedHashMap<>();
-    this.config.mvClusterKeys.forEach(clusterKeyProperties -> {
-      final String[] parts = clusterKeyProperties.split(":");
-
-      if (parts.length != 2) {
-        throw new ConfigException(String.format("The cluster keys config (%s) is invalid.", clusterKeyProperties));
-      }
-
-      clusterKeysPropertyMap.put(parts[0], parts[1]);
-    });
-
-    clusterKeysPropertyMap.keySet().forEach(clusterKey -> {
-      if (Objects.isNull(valueSchema.field(clusterKey))) {
-        throw new ConfigException(String.format("The cluster key (%s) is not defined in value schema", clusterKey));
-      }
-    });
-
-    final String clusterKeyStatement = Joiner.on(", ").join(clusterKeysPropertyMap.keySet());
-
-    final List<String> clusterKeysDirections = clusterKeysPropertyMap
-        .entrySet()
-        .stream()
-        .map(clusterKeysProperty -> {
-              String direction = "ASC";
-
-              if (clusterKeysProperty.getValue().equals("desc")) {
-                direction = "DESC";
-              }
-
-              return clusterKeysProperty.getKey() + " " + direction;
-            }
-        ).collect(Collectors.toList());
-
-    final String clusterKeyDirectionStatement = Joiner.on(", ").join(clusterKeysDirections);
-
-    final String materializedViewQuery =
+    String materializedViewQuery =
         "CREATE MATERIALIZED VIEW %s.%s AS "
             + "SELECT %s "
-            + "FROM %s.%s "
-            + "WHERE %s "
-            + "PRIMARY KEY ((%s), %s) "
-            + "WITH CLUSTERING ORDER BY (%s);";
+            + "FROM %s.%s";
 
-    return String.format(
+    materializedViewQuery = String.format(
         materializedViewQuery,
         keyspace,
         materializedViewName,
         selectStatement,
         keyspace,
-        tableName,
-        whereStatement,
-        partitionKeyStatement,
-        clusterKeyStatement,
-        clusterKeyDirectionStatement
-    );
+        tableName);
+
+    List<String> whereClauseItems = this.config.materializedViewWhereClauseProperties;
+
+    if (Objects.nonNull(whereClauseItems) && whereClauseItems.size() > 0) {
+      whereClauseItems.forEach(whereClauseItem -> {
+        if (Objects.isNull(valueSchema.field(whereClauseItem))) {
+          throw new ConfigException(String.format(
+              "The where clause item (%s) is not defined in value schema",
+              whereClauseItem
+          ));
+        }
+      });
+
+      whereClauseItems = whereClauseItems.stream().map(where -> {
+        where = where + " IS NOT null";
+
+        return where;
+      }).collect(Collectors.toList());
+
+      final String whereStatement = Joiner.on(" AND ").join(whereClauseItems);
+
+      materializedViewQuery = materializedViewQuery + String.format(" WHERE %s", whereStatement);
+    }
+
+    final List<String> partitionKeys = this.config.materializedViewPartitionKeys;
+
+    if (Objects.nonNull(partitionKeys) && partitionKeys.size() > 0) {
+      partitionKeys.forEach(partitionKey -> {
+        if (Objects.isNull(valueSchema.field(partitionKey))) {
+          throw new ConfigException(String.format(
+              "The partition key (%s) is not defined in value schema",
+              partitionKey
+          ));
+        }
+      });
+
+      String partitionKeyStatement = Joiner.on(", ").join(partitionKeys);
+
+      if (partitionKeys.size() > 1) {
+        partitionKeyStatement = "(" + partitionKeyStatement + ")";
+      }
+
+      final List<String> materializedViewClusterKeyList = this.config.materializedViewClusterKeys;
+      Map<String, String> clusterKeysPropertyMap = new LinkedHashMap<>();
+
+      if (Objects.nonNull(materializedViewClusterKeyList) && materializedViewClusterKeyList.size() > 0) {
+        clusterKeysPropertyMap = SchemaUtil.parseMappings(materializedViewClusterKeyList);
+      }
+
+      clusterKeysPropertyMap.keySet().forEach(clusterKey -> {
+        if (Objects.isNull(valueSchema.field(clusterKey))) {
+          throw new ConfigException(String.format("The cluster key (%s) is not defined in value schema", clusterKey));
+        }
+      });
+
+      String clusterKeyStatement = Joiner.on(", ").join(clusterKeysPropertyMap.keySet());
+
+      if (!clusterKeyStatement.equals("")) {
+        clusterKeyStatement = ", " + clusterKeyStatement;
+      }
+
+      materializedViewQuery =
+          materializedViewQuery + String.format(" PRIMARY KEY (%s%s)", partitionKeyStatement, clusterKeyStatement);
+
+      final List<String> clusterKeysDirections = clusterKeysPropertyMap
+          .entrySet()
+          .stream()
+          .map(clusterKeysProperty -> {
+                String direction = "ASC";
+
+                if (clusterKeysProperty.getValue().equals("desc")) {
+                  direction = "DESC";
+                }
+
+                return clusterKeysProperty.getKey() + " " + direction;
+              }
+          ).collect(Collectors.toList());
+
+      final String clusterKeyDirectionStatement = Joiner.on(", ").join(clusterKeysDirections);
+
+      if (!clusterKeyDirectionStatement.equals("")) {
+        materializedViewQuery =
+            materializedViewQuery + String.format(" WITH CLUSTERING ORDER BY (%s)", clusterKeyDirectionStatement);
+      }
+    }
+
+    return materializedViewQuery.concat(";");
   }
 
   static class ScyllaDbSchemaKey implements Comparable<ScyllaDbSchemaKey> {
